@@ -152,6 +152,9 @@ def processar_centauro(file_path):
         for col in numeric_cols:
             df[col] = df[col].apply(convert_to_float)
         
+        # Adicionar coluna "Tipo" com base no valor
+        df["Tipo"] = df["VALOR TOTAL DOS PRODUTOS"].apply(lambda x: "Extorno" if x < 0 else "Produto")
+        
         # Garantir que 'STATUS' exista
         if 'STATUS' not in df.columns:
             df['STATUS'] = "Não informado"
@@ -210,6 +213,9 @@ def processar_netshoes_ns2(file_path):
         if "FRETE FIXO" in df.columns:
             df = df.drop(columns=["FRETE FIXO"])
         
+        # Adicionar coluna "Tipo" com base no valor
+        df["Tipo"] = df["VALOR TOTAL DOS PRODUTOS"].apply(lambda x: "Extorno" if x < 0 else "Produto")
+        
         return df
     except Exception as e:
         registrar_erro(os.path.basename(file_path), "Leitura_Erro", str(e))
@@ -237,11 +243,8 @@ def processar_netshoes_magalu(file_path):
             "Tarifa fixa por pedido": "FRETE FIXO"
         }, inplace=True)
         
-        # Garantir que 'STATUS' exista
-        if 'STATUS' not in df.columns:
-            df['STATUS'] = "Não informado"
-        else:
-            df['STATUS'] = df['STATUS'].fillna("Não informado")
+        # Garantir que as colunas categóricas sejam do tipo string
+        df["CÓDIGO PEDIDO"] = df["CÓDIGO PEDIDO"].astype(str)
         
         # Aplicando a função de conversão personalizada para números
         monetary_columns = ["VALOR TOTAL DOS PRODUTOS", "FRETE TOTAL", "COMISSAO", "FRETE FIXO"]
@@ -265,6 +268,15 @@ def processar_netshoes_magalu(file_path):
         
         # Aplicando a função de conversão para datas com dayfirst=True
         df["DATA PEDIDO"] = df["DATA PEDIDO"].apply(lambda x: convert_to_date(x, dayfirst=True))
+        
+        # Adicionar coluna "Tipo" com base no valor
+        df["Tipo"] = df["VALOR TOTAL DOS PRODUTOS"].apply(lambda x: "Extorno" if x < 0 else "Produto")
+        
+        # Garantir que 'STATUS' exista
+        if 'STATUS' not in df.columns:
+            df['STATUS'] = "Não informado"
+        else:
+            df['STATUS'] = df['STATUS'].fillna("Não informado")
         
         return df
     except Exception as e:
@@ -299,11 +311,13 @@ def conciliar_dados(vendas, centauro, netshoes_ns2, netshoes_magalu):
     for _, row in vendas_grouped.iterrows():
         codigo = row["CÓDIGO PEDIDO"]
         pedidos_dict[codigo] = {
+            "CÓDIGO PEDIDO": codigo,
             "DATA PEDIDO": row["DATA PEDIDO"],
             "MARKETPLACE": row["MARKETPLACE"],
             "STATUS": row["STATUS"],
             "Valor Esperado": row["VALOR ESPERADO"],
-            "Valor Recebido": 0.0,
+            "Valor Recebido": 0.0,  # Soma dos Produtos
+            "Extorno": 0.0,         # Soma dos Extornos
             "Diferença": 0.0,
             "Conciliado": "OK",
             "Possível Motivo": "Nenhum",
@@ -311,25 +325,31 @@ def conciliar_dados(vendas, centauro, netshoes_ns2, netshoes_magalu):
             "Outro Erro": "✅"
         }
 
-    # Função para acumular valores recebidos
-    def acumular_recebido(df, fonte):
+    # Função para acumular valores recebidos e extornos
+    def acumular_recebido_extorno(df, fonte):
         for _, row in df.iterrows():
             codigo = row["CÓDIGO PEDIDO"]
             valor = row.get("VALOR TOTAL DOS PRODUTOS", 0.0)
+            tipo = row.get("Tipo", "Produto")
             if pd.isna(valor):
                 valor = 0.0
             valor = float(valor)
             if codigo in pedidos_dict:
-                pedidos_dict[codigo]["Valor Recebido"] += valor
+                if tipo == "Produto":
+                    pedidos_dict[codigo]["Valor Recebido"] += valor
+                elif tipo == "Extorno":
+                    pedidos_dict[codigo]["Extorno"] += valor
             else:
                 # Caso o pedido não esteja em vendas, adiciona com Valor Esperado = 0
                 pedidos_dict[codigo] = {
+                    "CÓDIGO PEDIDO": codigo,
                     "DATA PEDIDO": row.get("DATA PEDIDO", np.nan),
                     "MARKETPLACE": row.get("MARKETPLACE", ""),
                     "STATUS": row.get("STATUS", "Não informado"),
                     "Valor Esperado": 0.0,
-                    "Valor Recebido": valor,
-                    "Diferença": valor,
+                    "Valor Recebido": valor if tipo == "Produto" else 0.0,
+                    "Extorno": valor if tipo == "Extorno" else 0.0,
+                    "Diferença": 0.0,
                     "Conciliado": "Divergente",
                     "Possível Motivo": "Pedido não encontrado na planilha de vendas.",
                     "Erro de Valor": "❌",
@@ -337,18 +357,18 @@ def conciliar_dados(vendas, centauro, netshoes_ns2, netshoes_magalu):
                 }
 
     # Acumular valores de Centauro
-    acumular_recebido(centauro, "Centauro")
+    acumular_recebido_extorno(centauro, "Centauro")
 
     # Acumular valores de Netshoes NS2
-    acumular_recebido(netshoes_ns2, "Netshoes NS2")
+    acumular_recebido_extorno(netshoes_ns2, "Netshoes NS2")
 
     # Acumular valores de Netshoes Magalu
-    acumular_recebido(netshoes_magalu, "Netshoes Magalu")
+    acumular_recebido_extorno(netshoes_magalu, "Netshoes Magalu")
 
     # Agora, calcular a diferença e conciliar
     for codigo, dados in pedidos_dict.items():
         dados["Diferença"] = dados["Valor Recebido"] - dados["Valor Esperado"]
-
+        
         # Verificar Erro de Valor
         if abs(dados["Diferença"]) >= 0.01:
             dados["Erro de Valor"] = "❌"
@@ -356,15 +376,20 @@ def conciliar_dados(vendas, centauro, netshoes_ns2, netshoes_magalu):
             dados["Possível Motivo"] = "Verificar discrepâncias no valor do pedido."
         else:
             dados["Erro de Valor"] = "✅"
-
-        # Verificar Outro Erro (exemplo: Falha na consolidação)
-        # Aqui você pode adicionar lógica adicional para identificar outros erros
-        # Por enquanto, vamos manter como "✅" se não houver motivo específico
-        dados["Outro Erro"] = "✅"
+        
+        # Verificar se Extorno está balanceado
+        if abs(dados["Extorno"]) >= 0.01:
+            # Extorno deve balancear as devoluções
+            # Aqui, você pode adicionar lógica adicional se houver requisitos específicos
+            dados["Outro Erro"] = "❌"
+            dados["Conciliado"] = "Divergente"
+            if dados["Possível Motivo"] == "Nenhum":
+                dados["Possível Motivo"] = "Verificar extornos do pedido."
+        else:
+            dados["Outro Erro"] = "✅"
 
     # Converter o dicionário para DataFrame
-    final_df = pd.DataFrame.from_dict(pedidos_dict, orient='index').reset_index()
-    final_df.rename(columns={"index": "CÓDIGO PEDIDO"}, inplace=True)
+    final_df = pd.DataFrame.from_dict(pedidos_dict, orient='index').reset_index(drop=True)
 
     return final_df
 
@@ -434,7 +459,7 @@ def carregar_dados_locais():
     if all_netshoes_ns2:
         combined_netshoes_ns2 = pd.concat(all_netshoes_ns2, ignore_index=True)
     else:
-        combined_netshoes_ns2 = pd.DataFrame(columns=["CÓDIGO PEDIDO", "VALOR TOTAL DOS PRODUTOS"])
+        combined_netshoes_ns2 = pd.DataFrame(columns=["CÓDIGO PEDIDO", "VALOR TOTAL DOS PRODUTOS", "Tipo"])
 
     # Processar Netshoes Magalu
     all_netshoes_magalu = []
@@ -446,7 +471,7 @@ def carregar_dados_locais():
     if all_netshoes_magalu:
         combined_netshoes_magalu = pd.concat(all_netshoes_magalu, ignore_index=True)
     else:
-        combined_netshoes_magalu = pd.DataFrame(columns=["CÓDIGO PEDIDO", "VALOR TOTAL DOS PRODUTOS"])
+        combined_netshoes_magalu = pd.DataFrame(columns=["CÓDIGO PEDIDO", "VALOR TOTAL DOS PRODUTOS", "Tipo"])
 
     return combined_vendas, combined_centauro, combined_netshoes_ns2, combined_netshoes_magalu
 
@@ -468,6 +493,7 @@ def main():
             "STATUS",
             "Valor Esperado",
             "Valor Recebido",
+            "Extorno",
             "Diferença",
             "Conciliado",
             "Possível Motivo",
@@ -583,6 +609,28 @@ def main():
             # Exibir DataFrame com estilos
             st.dataframe(styled_df_filtrado, height=600)
 
+            # Adicionar funcionalidade para visualizar RAW DATA
+            st.markdown("### 📋 RAW DATA")
+            selected_pedido = st.selectbox("Selecione um CÓDIGO PEDIDO para ver os dados brutos:", df_filtrado["CÓDIGO PEDIDO"].unique())
+            if selected_pedido:
+                # Obter dados brutos de todas as fontes para o pedido selecionado
+                raw_data_vendas = vendas[vendas["CÓDIGO PEDIDO"] == selected_pedido]
+                raw_data_centauro = centauro[centauro["CÓDIGO PEDIDO"] == selected_pedido]
+                raw_data_netshoes_ns2 = netshoes_ns2[netshoes_ns2["CÓDIGO PEDIDO"] == selected_pedido]
+                raw_data_netshoes_magalu = netshoes_magalu[netshoes_magalu["CÓDIGO PEDIDO"] == selected_pedido]
+                
+                st.markdown("#### Vendas")
+                st.dataframe(raw_data_vendas, height=200)
+                
+                st.markdown("#### Centauro")
+                st.dataframe(raw_data_centauro, height=200)
+                
+                st.markdown("#### Netshoes NS2")
+                st.dataframe(raw_data_netshoes_ns2, height=200)
+                
+                st.markdown("#### Netshoes Magalu")
+                st.dataframe(raw_data_netshoes_magalu, height=200)
+
             # Legenda
             st.markdown("### 🗒️ Legenda")
             st.markdown("✅ **OK**: Conciliado sem divergências.")
@@ -592,13 +640,15 @@ def main():
 
         with tabs[1]:
             st.subheader("📊 Estatísticas")
-            col_a, col_b, col_c = st.columns(3)
+            col_a, col_b, col_c, col_d = st.columns(4)
             with col_a:
                 st.metric("Total de Pedidos", len(final_df_reduzido))
             with col_b:
                 st.metric("Pedidos Conciliados", len(final_df_reduzido[final_df_reduzido['Conciliado'] == "OK"]))
             with col_c:
                 st.metric("Pedidos Divergentes", len(final_df_reduzido[final_df_reduzido['Conciliado'] == "Divergente"]))
+            with col_d:
+                st.metric("Total Extornos", final_df_reduzido["Extorno"].sum())
 
             # Gráfico de Distribuição de Erros
             st.subheader("📉 Distribuição de Erros")
